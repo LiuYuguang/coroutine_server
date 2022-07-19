@@ -6,12 +6,12 @@
 #include <errno.h>
 #include <string.h>
 #include <fcntl.h>
-#include <assert.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/epoll.h>
 #include "coroutine.h"
 #include "btree.h"
+#include "deque.h"
 
 #define REMOTE_BACKLOG 128
 #define REMOTE_PORT 8888
@@ -26,18 +26,33 @@ typedef struct{
 }Header;
 
 int dummyfd = -1;
-int localfd = -1;
 btree *tree = NULL;
+deque_t task_queue, worker_queue;
 
-inline void setnonblock(int fd){
-    int flags=0;
-    flags = fcntl(fd,F_GETFL);
-    assert(fcntl(fd,F_SETFL,flags|O_NONBLOCK) == 0);
+typedef struct{
+    uint64_t co_id;
+    size_t len;
+    char *data;
+    deque_t task_node;
+}Task;
+
+typedef struct{
+    uint64_t co_id;
+    deque_t worker_node;
+}Worker;
+
+inline static int nonblock_socket(const int sock){
+    int flags = fcntl(sock, F_GETFL);
+
+    if (flags != -1){
+        flags = fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    }
+    return flags;
 }
 
-inline void setreuse(int fd){
+inline static int reuse_socket(const int sock){
     int sockopt = 1;
-    assert(setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&sockopt,sizeof(sockopt)) == 0);
+    return setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,&sockopt,sizeof(sockopt));
 }
 
 int server_accept(schedule* S, int sockfd, struct sockaddr *addr, socklen_t *addrlen, int once){
@@ -78,12 +93,12 @@ int server_accept(schedule* S, int sockfd, struct sockaddr *addr, socklen_t *add
     return rc;
 }
 
-ssize_t server_send(schedule* S,int sockfd, const void *buf, size_t len, int flags, int once){
+ssize_t server_send(schedule* S,int sockfd, const void *buf, size_t len, int once){
     ssize_t rc = -1;
     
     again:
 
-    rc = send(sockfd, buf, len, flags);
+    rc = send(sockfd, buf, len, 0);
     if(rc == -1){
         if(errno == EINTR){
             // 被信号中断, 下次继续读
@@ -106,12 +121,12 @@ ssize_t server_send(schedule* S,int sockfd, const void *buf, size_t len, int fla
     return rc;
 }
 
-ssize_t server_recv(schedule* S, int sockfd, void *buf, size_t len, int flags, int once){
+ssize_t server_recv(schedule* S, int sockfd, void *buf, size_t len, int once){
     ssize_t rc = -1;
     
     again:
 
-    rc = recv(sockfd, buf, len, flags);
+    rc = recv(sockfd, buf, len, 0);
     if(rc == 0){
         fprintf(stderr,"close by peer errno[%d]%s\n",errno,strerror(errno));
     }else if(rc == -1){
@@ -144,16 +159,16 @@ ssize_t io_copy(schedule* S, int destfd, int srcfd, size_t len){
 
     while(len){
         n = len < sizeof(tmp) ? len : sizeof(tmp);
-        rc = server_recv(S,srcfd,tmp,n,0,1);
+        rc = server_recv(S,srcfd,tmp,n,1);
         if(rc == -1){
             break;
         }
 
         n = rc;
         if(destfd >= 0){
-            rc = server_send(S,destfd,tmp,n,0,1);
+            rc = server_send(S,destfd,tmp,n,1);
             if(rc == -1){
-                break;
+                destfd = -1;
             }
         }
         
@@ -166,176 +181,196 @@ ssize_t io_copy(schedule* S, int destfd, int srcfd, size_t len){
 
 void remote_client_handle(schedule* S,void* arg){
     uint64_t co_id = coroutine_id(S);
-    int sockfd = *(int*)arg,rc;
-    char tmp[1024];
+    int sockfd = *(int*)arg;
+    char *buf = malloc(1024);
     ssize_t len;
-    Header header;
-
-    // printf("%s start %lu\n",__FUNCTION__,co_id);
+    Task *task = NULL;
 
     // 接收数据
     coroutine_alarm(S,1000);// 读数据1秒
-    len = server_recv(S, sockfd, tmp, sizeof(tmp), 0, 1);
-    // printf("fd %d rc %ld\n", sockfd, len);
+    len = server_recv(S, sockfd, buf, 1024, 1);
     coroutine_alarm(S,0);
-
-    if(len <=0 ){
-        // printf("recv fail %ld\n",len);
+    
+    if(len <= 0){
         goto finish;
     }
 
-    // 发送给local
-    coroutine_alarm(S,10*1000);// 发数据10秒
-    if(coroutine_cond_acquire(S) == -1){
-        // printf("lock fail\n");
-        goto finish;
+    btree_insert(tree,co_id,(intptr_t)arg,1);
+
+    task = malloc(sizeof(Task));
+    task->co_id = co_id;
+    task->data = buf;
+    task->len = len;
+    deque_push(&task_queue,&task->task_node);
+
+    if(!deque_empty(&worker_queue)){
+        deque_t *node = deque_pop(&worker_queue);
+        Worker *woker = deque_data(node,Worker,worker_node);
+        coroutine_wake(S, woker->co_id);
     }
-    // printf("lock success\n");
 
-    while(localfd == -1 && (rc=coroutine_cond_wait(S)) == 0);
-    if(rc != 0){
-        // printf("wait fail\n");
-        goto finish;
-    }
-
-    // printf("wait success\n");
-
-    // printf("send local\n");
-
-    header.id = co_id;
-    header.len = len;
-    server_send(S,localfd,&header,sizeof(header),0,1);
-    server_send(S,localfd,tmp,header.len,0,1);
-
-    // printf("send local finish\n");
-
-    coroutine_cond_notify(S);// 唤醒下一个
-    coroutine_cond_release(S);
-    coroutine_alarm(S,0);// 设置关闭触发
-
-    // 等待sock关闭 
-    coroutine_alarm(S,1000);// 设置5秒后触发
+    coroutine_alarm(S,10*1000);
+    coroutine_io_ctl(S,sockfd,EPOLL_CTL_ADD,EPOLLRDHUP);
     coroutine_wait(S);
-    coroutine_alarm(S,0);// 设置关闭触发
-    shutdown(sockfd,SHUT_RDWR);
+    coroutine_alarm(S,0);
+    
+    btree_delete(tree,co_id,NULL);
+    deque_remove(&task->task_node);
 
     finish:
-    // printf("%s finish\n",__FUNCTION__);
-
-    // 释放map
-    btree_delete(tree,co_id,NULL);
+    free(buf);
+    free(task);
     free(arg);
-    // 关闭sock
     close(sockfd);
 }
 
 void remote_server(schedule* S,void* arg){
     int listenfd = -1;
     int sockfd;
-    uint64_t co_id;
     char ipaddress[50];
-    struct sockaddr_in addr;
+    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(*(short*)arg), .sin_addr.s_addr = htonl(INADDR_ANY)};
     socklen_t addr_len = sizeof(addr);
+    free(arg);
 
     listenfd = socket(AF_INET,SOCK_STREAM,0);
-    
-    // 复用
-    setreuse(listenfd);
-    // 非阻塞IO
-    setnonblock(listenfd);
-
-    addr.sin_family = AF_INET;
-	addr.sin_port = htons((int)arg);
-	addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    assert(bind(listenfd,(struct sockaddr*)&addr,sizeof(addr)) == 0);
-    assert(listen(listenfd,REMOTE_BACKLOG) == 0);
+    reuse_socket(listenfd);
+    nonblock_socket(listenfd);
+    bind(listenfd,(struct sockaddr*)&addr,sizeof(addr));
+    listen(listenfd,REMOTE_BACKLOG);
 
     coroutine_io_ctl(S,listenfd,EPOLL_CTL_ADD,EPOLLIN);
     while((sockfd = server_accept(S,listenfd,(struct sockaddr*)&addr,&addr_len,0)) >= 0){
-        // printf("accpet fd %d %s:%d\n",sockfd,inet_ntop(AF_INET,&addr.sin_addr,ipaddress,sizeof(ipaddress)),ntohs(addr.sin_port));
+        nonblock_socket(sockfd);
 
-        // 非阻塞
-        setnonblock(sockfd);
-        int *arg = malloc(sizeof(int));
-        *arg = sockfd;
-        co_id = coroutine_new(S,remote_client_handle,arg);
-        btree_insert(tree,co_id,(intptr_t)arg,1);
+        int *pfd = malloc(sizeof(int));
+        *pfd = sockfd;
+        coroutine_new(S,remote_client_handle,pfd);
     };
     coroutine_io_ctl(S,listenfd,EPOLL_CTL_DEL,EPOLLIN);
     close(listenfd);
 }
 
-void local_server(schedule* S,void* arg){
-    int listenfd = -1;
-    int sockfd, remotefd, *pfd;
-    struct sockaddr_un addr;
-    socklen_t addr_len = sizeof(addr);
+void local_send(schedule* S,void* arg){
+    int sockfd = *(int*)arg, rc;
+    free(arg);
+    uint64_t co_id = coroutine_id(S);
+    char *buf=NULL;
+    size_t cap=0;
 
+    Worker *woker = malloc(sizeof(Worker));
+    woker->co_id = co_id;
+    deque_init(&woker->worker_node);
+
+    deque_t *node;
+    for(;;){
+        while(deque_empty(&task_queue)){
+            coroutine_io_ctl(S,sockfd,EPOLL_CTL_ADD,EPOLLRDHUP);
+            deque_push(&worker_queue,&woker->worker_node);
+            rc = coroutine_wait(S);
+            coroutine_io_ctl(S,sockfd,EPOLL_CTL_DEL,EPOLLRDHUP);
+            deque_remove(&woker->worker_node);
+            if(rc == -1){
+                goto finish;
+            }
+        }
+
+        node = deque_pop(&task_queue);
+        Task *task = deque_data(node, Task, task_node);
+
+        if(cap < sizeof(Header) + task->len){
+            char *p = buf;
+            buf = realloc(buf,sizeof(Header) + task->len);
+            if(buf == NULL){
+                buf = p;
+                continue;
+            }
+            cap = sizeof(Header) + task->len;
+        }
+        Header *header = (Header *)buf;
+        header->id = task->co_id;
+        header->len = task->len;
+        memcpy(header->data,task->data,task->len);
+        server_send(S, sockfd,buf,sizeof(Header) + task->len,1);
+    }
+    finish:
+    free(buf);
+    free(woker);
+    close(sockfd);
+}
+
+void local_recv(schedule* S,void* arg){
+    int sockfd = *(int*)arg, rc;
+    free(arg);
     ssize_t len;
     Header header;
 
+    for(;;){
+        len = server_recv(S, sockfd, &header, sizeof(header), 1);
+        if(len <= 0){
+            break;
+        }
+        int *p = NULL;
+        int remote_fd = -1;
+        if(btree_search(tree,header.id,(intptr_t*)&p) == 1){
+            remote_fd = *p;
+        }else{
+            remote_fd = -1;
+        }
+        io_copy(S,remote_fd,sockfd,header.len);
+        coroutine_wake(S,header.id);
+    }
+    close(sockfd);
+}
+
+void local_server(schedule* S,void* arg){
+    int listenfd = -1;
+    int sockfd, *pfd;
+    struct sockaddr_un addr = {.sun_family=AF_UNIX, .sun_path = LOCAL_FILE};
+    socklen_t addr_len = sizeof(addr);
+    
     unlink(LOCAL_FILE);
 
     listenfd = socket(AF_UNIX, SOCK_STREAM, 0);
-    // 复用
-    setreuse(listenfd);
-    // 非阻塞IO
-    setnonblock(listenfd);
+    reuse_socket(listenfd);
+    nonblock_socket(listenfd);
+    bind(listenfd, (struct sockaddr*)&addr, sizeof(addr));
+    listen(listenfd, LOCAL_BACKLOG);
 
-    addr.sun_family = AF_UNIX;
-    strcpy(addr.sun_path,LOCAL_FILE);
-    assert(bind(listenfd, (struct sockaddr*)&addr, sizeof(addr)) == 0);
-    assert(listen(listenfd, LOCAL_BACKLOG) == 0);
+    coroutine_io_ctl(S,listenfd,EPOLL_CTL_ADD,EPOLLIN);
+    while((sockfd = server_accept(S,listenfd,(struct sockaddr*)&addr,&addr_len,0)) >= 0){
+        nonblock_socket(sockfd);
 
-    while((sockfd = server_accept(S,listenfd,(struct sockaddr*)&addr,&addr_len,1)) >= 0){
-        // 非阻塞
-        setnonblock(sockfd);
-        
-        coroutine_cond_acquire(S);// 加锁
-        localfd = dup(sockfd);
-        coroutine_cond_notify(S);// 唤醒
-        coroutine_cond_release(S);// 解锁
+        pfd = malloc(sizeof(int));
+        *pfd = sockfd;
+        coroutine_new(S,local_send,pfd);
 
-        for(;;){
-            len = server_recv(S, sockfd, &header, sizeof(header), 0, 1);
-            if(len <= 0){
-                fprintf(stderr,"errno%d, strerror%s\n",errno,strerror(errno));
-                break;
-            }
-            // printf("header id %lu\n",header.id);
-            if(btree_search(tree,header.id,(intptr_t*)&pfd) == 1){
-                remotefd = *pfd;
-            }else{
-                remotefd = -1;
-            }
-            // printf("local remotefd %d\n",remotefd);
-
-            io_copy(S, remotefd, sockfd, header.len);
-            coroutine_wake(S, header.id);// 唤醒协程
-        }
-
-        coroutine_cond_acquire(S);
-        close(sockfd);
-        close(localfd);
-        localfd = -1;
-        coroutine_cond_release(S);
+        sockfd = dup(sockfd);
+        pfd = malloc(sizeof(int));
+        *pfd = sockfd;
+        coroutine_new(S,local_recv,pfd);
     }
-
+    coroutine_io_ctl(S,listenfd,EPOLL_CTL_DEL,EPOLLIN);
     close(listenfd);
 }
 
 int main(){
-    dummyfd = open("/dev/null",O_RDONLY | O_CLOEXEC);
-    assert(dummyfd >= 0);
+    setlinebuf(stdout);
+    setlinebuf(stderr);
 
-    assert(btree_create(4096,&tree) == 0);
+    dummyfd = open("/dev/null",O_RDONLY | O_CLOEXEC);
+
+    btree_create(4096,&tree);
+
+    deque_init(&task_queue);
+    deque_init(&worker_queue);
 
     schedule *S = coroutine_open();
-    assert(S);
 
     short port;
     for(port=8890;port<8900;port++){
-        coroutine_new(S,remote_server,port);    
+        short *p = malloc(sizeof(short));
+        *p = port;
+        coroutine_new(S,remote_server,p);
     }
     coroutine_new(S,local_server,NULL);
     coroutine_loop(S);

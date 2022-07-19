@@ -22,7 +22,7 @@
 #define MAXEVENT 100
 
 #define save_stack() \
-    register void *sp asm("sp"); \
+    register void *sp asm("rsp"); \
     ptrdiff_t size = S->stack + STACK_SIZE - (char*)sp; \
     if(co->cap < size){\
         free(co->stack);\
@@ -166,115 +166,6 @@ int coroutine_wake(schedule *S,uint64_t id){
     return -1;
 }
 
-int coroutine_cond_acquire(schedule *S){
-    coroutine *co = S->running;
-    deque_push(&S->lock,&co->lock_node);// 等待获取锁
-    if(deque_head(&S->lock) == &co->lock_node){
-        return 0;
-    }
-
-    // 当前没有运行
-    S->running = NULL;
-    // 阻塞状态
-    co->status = COROUTINE_BLOCKED;
-    co->rc = 0;
-    co->co_errno = 0;
-    S->blocked++;
-    // 保存栈
-    save_stack();
-    // 切换
-    swapcontext(&co->ctx,&S->main);
-    errno = co->co_errno;
-    if(co->rc != 0){
-        // 放弃锁
-        deque_remove(&co->lock_node);
-    }
-    return co->rc;
-}
-
-int coroutine_cond_release(schedule *S){
-    coroutine *co = S->running;
-    deque_t *node;
-
-    // 放弃锁
-    deque_remove(&co->lock_node);
-
-    // 锁不为空, 唤醒下一个
-    if(!deque_empty(&S->lock)){
-        node = deque_pop(&S->lock);
-        co = deque_data(node,coroutine,lock_node);
-        queue_push(&S->ready,&co->ready_node); // 加入就绪队列
-        co->status = COROUTINE_READY; // 更新状态
-        S->blocked--;
-    }
-    return 0;
-}
-
-int coroutine_cond_wait(schedule *S){
-    coroutine *co = S->running,*co2 = NULL;
-    deque_t *node;
-
-    // 放弃锁
-    deque_remove(&co->lock_node);
-    // 加入等待队列
-    deque_push(&S->cond,&co->lock_node);
-    // 锁不为空, 唤醒下一个
-    if(!deque_empty(&S->lock)){
-        node = deque_pop(&S->lock);
-        co2 = deque_data(node,coroutine,lock_node);
-        queue_push(&S->ready,&co2->ready_node); // 加入就绪队列
-        co2->status = COROUTINE_READY; // 更新状态
-        S->blocked--;
-    }
-
-    // 当前没有运行
-    S->running = NULL;
-    // 阻塞状态
-    co->status = COROUTINE_BLOCKED;
-    co->rc = 0;
-    co->co_errno = 0;
-    S->blocked++;
-    // 保存栈
-    save_stack();
-    // 切换
-    swapcontext(&co->ctx,&S->main);
-    errno = co->co_errno;
-
-    if(co->rc != 0){
-        return co->rc;
-    }
-
-    return coroutine_cond_acquire(S);
-}
-
-int coroutine_cond_notify(schedule *S){
-    coroutine *co=NULL;
-    deque_t *node=NULL;
-    if(!deque_empty(&S->cond)){
-        node = deque_pop(&S->cond);
-        co = deque_data(node,coroutine,lock_node);
-
-        queue_push(&S->ready,&co->ready_node); // 加入就绪队列
-        co->status = COROUTINE_READY; // 更新状态
-        S->blocked--;
-    }
-    return 0;
-}
-
-int coroutine_cond_notify_all(schedule *S){
-    coroutine *co=NULL;
-    deque_t *node=NULL;
-    while(!deque_empty(&S->cond)){
-        node = deque_pop(&S->cond);
-        co = deque_data(node,coroutine,lock_node);
-
-        queue_push(&S->ready,&co->ready_node); // 加入就绪队列
-        co->status = COROUTINE_READY; // 更新状态
-        S->blocked--;
-    }
-    return 0;
-}
-
 void resume_handle(schedule *S,coroutine *co){
     co->func(S,co->arg);
     co->status = COROUTINE_DEAD;
@@ -317,6 +208,10 @@ static void _ioloop(schedule *S,void *arg){
                 co = (coroutine *)events[i].data.ptr;
                 
                 if(co->status == COROUTINE_BLOCKED){
+                    if((events[i].events & EPOLLHUP) || (events[i].events & EPOLLRDHUP)){
+                        co->rc = -1;
+                        co->co_errno = ECONNRESET;
+                    }
                     queue_push(&S->ready,&co->ready_node); // 加入就绪队列
                     co->status = COROUTINE_READY; // 更新状态
                     S->blocked--;
@@ -336,7 +231,7 @@ int coroutine_loop(schedule *S){
         ready_node = queue_pop(&S->ready);// epoll一直存在
         co = queue_data(ready_node,coroutine,ready_node);
         S->running = co;
-        
+
         if(co->status == COROUTINE_INIT){
             co->status = COROUTINE_RUNNING;
             memset(S->stack,0,STACK_SIZE);

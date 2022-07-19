@@ -23,6 +23,9 @@ typedef struct{
 #define RESPONSE "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"
 
 int main(){
+    setlinebuf(stdout);
+    setlinebuf(stderr);
+
     const char socket_file[] = "/tmp/socksdtcp.sock";
     int sockfd;
     struct sockaddr_un addr;
@@ -48,7 +51,7 @@ int main(){
             fprintf(stderr,"errno%d, strerror%s\n",errno,strerror(errno));
             break;
         }
-
+        // printf("recv header.id %lu len %lu\n",header.id,header.len);
         while(header.len > 0){
             need = header.len < sizeof(tmp) ? header.len : sizeof(tmp);
             len = recv(sockfd,tmp,need,0);
